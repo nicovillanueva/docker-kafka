@@ -1,53 +1,13 @@
 #!/bin/sh
 
 # Optional ENV variables:
-# * ADVERTISED_HOST: the external ip for the container, e.g. `docker-machine ip \`docker-machine active\``
-# * ADVERTISED_PORT: the external port for Kafka, e.g. 9092
-# * ZK_CHROOT: the zookeeper chroot that's used by Kafka (without / prefix), e.g. "kafka"
 # * LOG_RETENTION_HOURS: the minimum age of a log file in hours to be eligible for deletion (default is 168, for 1 week)
 # * LOG_RETENTION_BYTES: configure the size at which segments are pruned from the log, (default is 1073741824, for 1GB)
 # * NUM_PARTITIONS: configure the default number of log partitions per topic
+# * AUTO_CREATE_TOPICS
+# * BROKER_COUNT
 
-# Configure advertised host/port if we run in helios
-if [ ! -z "$HELIOS_PORT_kafka" ]; then
-    ADVERTISED_HOST=`echo $HELIOS_PORT_kafka | cut -d':' -f 1 | xargs -n 1 dig +short | tail -n 1`
-    ADVERTISED_PORT=`echo $HELIOS_PORT_kafka | cut -d':' -f 2`
-fi
-
-# Set the external host and port
-if [ ! -z "$ADVERTISED_HOST" ]; then
-    echo "advertised host: $ADVERTISED_HOST"
-    if grep -q "^advertised.host.name" $KAFKA_HOME/config/server.properties; then
-        sed -r -i "s/#(advertised.host.name)=(.*)/\1=$ADVERTISED_HOST/g" $KAFKA_HOME/config/server.properties
-    else
-        echo "advertised.host.name=$ADVERTISED_HOST" >> $KAFKA_HOME/config/server.properties
-    fi
-fi
-if [ ! -z "$ADVERTISED_PORT" ]; then
-    echo "advertised port: $ADVERTISED_PORT"
-    if grep -q "^advertised.port" $KAFKA_HOME/config/server.properties; then
-        sed -r -i "s/#(advertised.port)=(.*)/\1=$ADVERTISED_PORT/g" $KAFKA_HOME/config/server.properties
-    else
-        echo "advertised.port=$ADVERTISED_PORT" >> $KAFKA_HOME/config/server.properties
-    fi
-fi
-
-# Set the zookeeper chroot
-if [ ! -z "$ZK_CHROOT" ]; then
-    # wait for zookeeper to start up
-    until /usr/share/zookeeper/bin/zkServer.sh status; do
-      sleep 0.1
-    done
-
-    # create the chroot node
-    echo "create /$ZK_CHROOT \"\"" | /usr/share/zookeeper/bin/zkCli.sh || {
-        echo "can't create chroot in zookeeper, exit"
-        exit 1
-    }
-
-    # configure kafka
-    sed -r -i "s/(zookeeper.connect)=(.*)/\1=localhost:2181\/$ZK_CHROOT/g" $KAFKA_HOME/config/server.properties
-fi
+# General configurations
 
 # Allow specification of log retention policies
 if [ ! -z "$LOG_RETENTION_HOURS" ]; then
@@ -71,5 +31,18 @@ if [ ! -z "$AUTO_CREATE_TOPICS" ]; then
     echo "auto.create.topics.enable=$AUTO_CREATE_TOPICS" >> $KAFKA_HOME/config/server.properties
 fi
 
-# Run Kafka
-$KAFKA_HOME/bin/kafka-server-start.sh $KAFKA_HOME/config/server.properties
+ADVERTISED_HOST=${ADVERTISED_HOST:-"localhost"}  # En Marathon, ADVERTISED_HOST debería ser el propio FQDN (y correr en modo Host)
+sed -r -i "s/#(advertised.host.name)=(.*)/\1=$ADVERTISED_HOST/g" $KAFKA_HOME/config/server.properties
+
+# ------
+
+mkdir -p "/var/log/kafka/"
+for BRKID in $(seq 0 $((${BROKER_COUNT:-1}-1))); do
+    echo "Configuring broker $BRKID"
+    cp $KAFKA_HOME/config/server.properties $KAFKA_HOME/config/server.properties-$BRKID
+    BRKPORT=$((9092+$BRKID))
+    sed -r -i "s/#BROKERID#/$BRKID/g" $KAFKA_HOME/config/server.properties-$BRKID
+    sed -r -i "s/#BROKERPORT#/$BRKPORT/g" $KAFKA_HOME/config/server.properties-$BRKID
+    JMX_PORT="1$BRKPORT" $KAFKA_HOME/bin/kafka-server-start.sh $KAFKA_HOME/config/server.properties-$BRKID &> /var/log/kafka/broker-$BRKID.log &
+done
+wait
